@@ -1,1 +1,105 @@
+name: Outreach auto (directory feed)
 
+# Fully automatic directory -> outreach loop. On weekday mornings (UK
+# business hours) it pulls the newest scraped businesses that have a
+# website and were never contacted, submits their contact forms with
+# formscout, and records the handover in the directory sheet's
+# Outreach ledger so nobody is ever pulled twice.
+#
+# NOTHING is committed back to this repo: results are written to the
+# sheet ledger only, so no lead or outcome data is ever published here.
+#
+# Schedule: AROUND THE CLOCK (user decision 2026-11-01, replacing
+# the earlier UK-working-hours-only schedule). A fresh run starts
+# every 2 hours and the concurrency lock queues it behind the one
+# still going, so form submissions run continuously, day and night.
+#
+# One-time setup in this repo (Settings -> Secrets and variables -> Actions):
+#   OUTREACH_CONFIG      the formscout submit config (same as cmm-outreach)
+#   MAPSCOUT_API_URL     the directory sheet's Apps Script web app URL
+#   MAPSCOUT_API_TOKEN   the token from the top of Code.gs
+#
+# IMPORTANT: when this workflow goes live here, DISABLE the
+# "Outreach auto" workflow in the old cmm-outreach repo — otherwise
+# both would pull the same businesses on the same morning.
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max businesses to contact this run"
+        type: string
+        default: "120"
+
+concurrency:
+  group: outreach-auto
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  outreach:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Get formscout
+        run: git clone --depth 1 https://github.com/zshahkazmi/formscout.git formscout
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies + Chromium
+        run: |
+          pip install requests
+          cd formscout
+          pip install -r requirements-browser.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Write config from secret
+        env:
+          OUTREACH_CONFIG: ${{ secrets.OUTREACH_CONFIG }}
+        run: printf '%s' "$OUTREACH_CONFIG" > outreach.yaml
+
+      - name: Pull new businesses from the directory
+        env:
+          MAPSCOUT_API_URL: ${{ secrets.MAPSCOUT_API_URL }}
+          MAPSCOUT_API_TOKEN: ${{ secrets.MAPSCOUT_API_TOKEN }}
+        run: |
+          mkdir -p leads results
+          python tools/pull_directory.py pull \
+            --url "$MAPSCOUT_API_URL" --token "$MAPSCOUT_API_TOKEN" \
+            --limit "${{ inputs.limit || '120' }}" \
+            --leads leads/auto-current.csv --keys auto-keys.json
+
+      - name: Submit forms (live)
+        run: |
+          if [ "$(wc -l < leads/auto-current.csv)" -gt 1 ]; then
+            cd formscout
+            python -m formscout submit ../leads/auto-current.csv \
+              --config ../outreach.yaml \
+              -o ../results/auto-${{ github.run_id }}.csv
+          else
+            echo "No new businesses to contact this run."
+          fi
+
+      - name: Record the handover in the directory ledger
+        if: always()
+        env:
+          MAPSCOUT_API_URL: ${{ secrets.MAPSCOUT_API_URL }}
+          MAPSCOUT_API_TOKEN: ${{ secrets.MAPSCOUT_API_TOKEN }}
+        run: |
+          if [ -f "results/auto-${{ github.run_id }}.csv" ] && [ -f auto-keys.json ]; then
+            python tools/pull_directory.py report \
+              --url "$MAPSCOUT_API_URL" --token "$MAPSCOUT_API_TOKEN" \
+              --keys auto-keys.json \
+              --results "results/auto-${{ github.run_id }}.csv"
+          else
+            echo "No results file — nothing to record; leads stay pending."
+          fi
