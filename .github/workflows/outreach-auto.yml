@@ -1,27 +1,23 @@
 name: Outreach auto (directory feed)
 
-# Fully automatic directory -> outreach loop. On weekday mornings (UK
-# business hours) it pulls the newest scraped businesses that have a
-# website and were never contacted, submits their contact forms with
-# formscout, and records the handover in the directory sheet's
-# Outreach ledger so nobody is ever pulled twice.
+# PARALLEL directory -> outreach engine (v3). Six runners work at the
+# same time, around the clock. Every runner pulls its own batch from
+# the directory sheet's endpoint; the endpoint CLAIMS each batch
+# atomically (12-hour lock), so two runners can never take the same
+# business, and every outcome is recorded in the sheet's Outreach
+# ledger — a business with a final outcome is never handed out again.
 #
 # NOTHING is committed back to this repo: results are written to the
-# sheet ledger only, so no lead or outcome data is ever published here.
-#
-# Schedule: AROUND THE CLOCK (user decision 2026-11-01, replacing
-# the earlier UK-working-hours-only schedule). A fresh run starts
-# every 2 hours and the concurrency lock queues it behind the one
-# still going, so form submissions run continuously, day and night.
+# sheet ledger only.
 #
 # One-time setup in this repo (Settings -> Secrets and variables -> Actions):
 #   OUTREACH_CONFIG      the formscout submit config (same as cmm-outreach)
 #   MAPSCOUT_API_URL     the directory sheet's Apps Script web app URL
 #   MAPSCOUT_API_TOKEN   the token from the top of Code.gs
 #
-# IMPORTANT: when this workflow goes live here, DISABLE the
-# "Outreach auto" workflow in the old cmm-outreach repo — otherwise
-# both would pull the same businesses on the same morning.
+# Requires Code.gs v3 (claim support) deployed on the sheet endpoint.
+# The per-runner limit below applies to EACH of the 6 runners
+# (default 120 each = up to 720 businesses per wave).
 
 on:
   schedule:
@@ -29,13 +25,9 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Max businesses to contact this run"
+        description: "Max businesses PER RUNNER this wave"
         type: string
         default: "120"
-
-concurrency:
-  group: outreach-auto
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -44,6 +36,14 @@ jobs:
   outreach:
     runs-on: ubuntu-latest
     timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    concurrency:
+      group: outreach-auto-${{ matrix.shard }}
+      cancel-in-progress: false
     steps:
       - name: Checkout this repo
         uses: actions/checkout@v4
@@ -67,7 +67,7 @@ jobs:
           OUTREACH_CONFIG: ${{ secrets.OUTREACH_CONFIG }}
         run: printf '%s' "$OUTREACH_CONFIG" > outreach.yaml
 
-      - name: Pull new businesses from the directory
+      - name: Pull a claimed batch from the directory
         env:
           MAPSCOUT_API_URL: ${{ secrets.MAPSCOUT_API_URL }}
           MAPSCOUT_API_TOKEN: ${{ secrets.MAPSCOUT_API_TOKEN }}
@@ -84,7 +84,7 @@ jobs:
             cd formscout
             python -m formscout submit ../leads/auto-current.csv \
               --config ../outreach.yaml \
-              -o ../results/auto-${{ github.run_id }}.csv
+              -o ../results/auto-${{ github.run_id }}-${{ matrix.shard }}.csv
           else
             echo "No new businesses to contact this run."
           fi
@@ -95,11 +95,11 @@ jobs:
           MAPSCOUT_API_URL: ${{ secrets.MAPSCOUT_API_URL }}
           MAPSCOUT_API_TOKEN: ${{ secrets.MAPSCOUT_API_TOKEN }}
         run: |
-          if [ -f "results/auto-${{ github.run_id }}.csv" ] && [ -f auto-keys.json ]; then
+          if [ -f "results/auto-${{ github.run_id }}-${{ matrix.shard }}.csv" ] && [ -f auto-keys.json ]; then
             python tools/pull_directory.py report \
               --url "$MAPSCOUT_API_URL" --token "$MAPSCOUT_API_TOKEN" \
               --keys auto-keys.json \
-              --results "results/auto-${{ github.run_id }}.csv"
+              --results "results/auto-${{ github.run_id }}-${{ matrix.shard }}.csv"
           else
-            echo "No results file — nothing to record; leads stay pending."
+            echo "No results file — nothing to record; claims expire and the businesses are retried."
           fi
