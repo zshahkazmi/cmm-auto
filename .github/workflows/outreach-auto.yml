@@ -21,7 +21,7 @@ name: Outreach auto (directory feed)
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       limit:
